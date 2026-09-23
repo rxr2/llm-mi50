@@ -11,11 +11,14 @@
 *.gguf
 results/
 **/results/
+preflight-report/
 
 # Build outputs and caches
 build/
 **/build/
 build-verification/CMakeCache-*.txt
+build-verification/disassembly/*
+!build-verification/disassembly/README.md
 **/CMakeCache.txt
 **/CMakeFiles/
 .cache/

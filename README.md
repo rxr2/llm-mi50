@@ -3,7 +3,8 @@
 **1× MI50 32 GB (gfx906, wave64) · Xeon E5-2680v2 · 128 GB DDR3 · Debian 13 / kernel 6.12 · Qwen3.8-27B Q4_0 (unsloth) + MTP**
 
 > **Answer.** Build **upstream `ggml-org/llama.cpp` @ `42916d83`** plus the 3 patches in `patches/`. That gives **`844e42b4b`**, and the SHA is reproducible.
-> Install STABLE **ROCm 7.1.1** (inbox driver, no dkms) and run `run-golden.sh`. Use f16 KV, `draft-mtp,ngram-mod` and a **fixed** `--spec-draft-n-max 3`.
+> Install STABLE **ROCm 7.1.1** (inbox driver, no dkms, → `/opt/rocm-7.1.1`, the same path `build.sh` defaults to) and run `run-golden.sh`. Use f16 KV, `draft-mtp,ngram-mod` and a **fixed** `--spec-draft-n-max 3`.
+> Day-1 flow, zero manual edits: install ROCm (`./install-rocm.sh stable`) → `./build.sh golden` → **`./preflight.sh`** → `./benchmark-mi50.sh …` (T0 first; see `PRE-FLIGHT-CHECKLIST.md`). Strict preflight needs the built binaries, so the build comes before it.
 > On the first day on the server, run the A/B against **`alex4300 @ f9616ce`** exactly as built (Plan B) with `benchmark-mi50.sh`.
 > No new kernel. It works and compiles for gfx906, but **it has not been measured on the card yet**. The server isn't available, so every tok/s figure in this doc comes from alex4300's measurements, not from this build.
 
@@ -13,14 +14,21 @@
 |---|---|
 | `patches/0001…0003` | the patch series (git am) on 42916d83 |
 | `PATCH-MANIFEST.md` | PATCH/SOURCE/SHA/FILES/DEPS/CONFLICTS/BENEFIT/RISK/STAGE/TOGGLE, conflict resolutions, pairwise overlap, blacklist |
-| `build.sh` | reproducible build of 5 variants (golden, golden-upmmq, golden-dpp, alex-exact, upstream), writes build-info + CMakeCache + checksums, test gate |
-| `install-rocm.sh` | STABLE (ROCm 7.1.1) / MODERN (TheRock 10.1 gfx906) / `check` |
+| `preflight.sh` | **the single pre-flight gate**: ends `READY_FOR_MI50_BENCHMARK` or `NOT_READY:` + reasons (gfx906, /dev/kfd, model sha256, binaries, ROCm + rocm-smi/rocprofv3/hipconfig paths via `rocm-env.sh`, HSA override, PCIe link recording, power cap, NUMA facts) |
+| `PRE-FLIGHT-CHECKLIST.md` | BEFORE SERVER ARRIVES / FIRST BOOT WITH MI50 / FIRST 30 MINUTES / FIRST 2 HOURS |
+| `BUILD-VERIFICATION.md` | what is verified without hardware, ISA artifacts, gates, harness tests |
+| `build.sh` | reproducible build of 5 variants (golden, golden-upmmq, golden-dpp, alex-exact, upstream), ROCm via shared `rocm-env.sh` (prefers `/opt/rocm-7.1.1`, then `/opt/rocm`, `/opt/therock`; explicit `ROCM_PATH` must be valid), writes build-info + CMakeCache + checksums, runs `verify-isa.sh`, **strict test gate incl. `MUL_MAT_VEC_FUSION` (nonzero exit or FAIL aborts — no `|| true`)** |
+| `rocm-env.sh` | the ONE ROCm resolution helper sourced by `preflight.sh` + `build.sh` + `benchmark-mi50.sh`: same `ROCM_PATH`/`PATH`/`LD_LIBRARY_PATH` and same `rocm-smi`/`rocprofv3`/`hipconfig` paths (preflight READY ⇒ benchmark tools are present) |
+| `verify-isa.sh` + `isa_verify.py` | gfx906 ISA verification after build: extracts ALL AMDGPU ELF objects, **groups symbols per ELF** (never the last loop file), verifies each required default (q4_0_breit n=1 base+fused / n=4 / n=8, q5_K_breit default, q6_K_breit default) against the TSV, **`e_flags` mach == 36 is a PASS condition**, scratch=0, disassembly from each symbol's own ELF → `build-verification/disassembly/` + `isa-report.json` (TSV is COPY'd into Docker) |
+| `install-rocm.sh` | STABLE (ROCm 7.1.1 → `/opt/rocm-7.1.1`) / MODERN (TheRock 10.1 gfx906) / `check` |
+| `model-provenance.sh` | exact GGUF provenance: HF repo URL, filename, sha256, size (single source of truth) |
 | `Dockerfile` | the same stack in a container, `--build-arg ROCM=stable\|modern`, `VARIANT=` |
-| `run-golden.sh` | **MI50-QWEN38-GOLDEN-BASELINE** runtime config |
-| `power.sh` | status / reset to stock 225 W / 1 s monitor |
-| `benchmark-mi50.sh` + `summarize.py` | T0–T10, results in `results/YYYY-MM-DD/<run>/` (dry run verified) |
+| `run-golden.sh` | **MI50-QWEN38-GOLDEN-BASELINE** runtime config; finds `~/mi50-builds/golden/build/bin` automatically or takes `BIN=` explicitly (never defaults to a missing `./bin`) |
+| `power.sh` | status / reset to stock 225 W / 1 s monitor with a **>95 °C abort** (writes `FILE.INVALID_THERMAL`) |
+| `benchmark-mi50.sh` + `summarize.py` + `spec_metrics.py` | T0–T10 with strict preflight first; **run isolation** (existing run dir with data FAILs, `ALLOW_APPEND=1` to override); power cap recorded per test group and **FAILs outside 220–226 W** (`ALLOW_POWER_MISMATCH=1` to override); thermal watchdog (`INVALID_THERMAL`) wraps suites **and** PROFILE/T0/T1/T3/T9-native/T10-native; `PROFILE=1` rocprofv3 mode; `NUMA_MODE=auto\|off`; warm-up never touches `requests.csv` and takes no `/metrics` snapshots; each measured request stores exact `/metrics` counter deltas (30-col `requests.csv`: `verification_steps`, `draft_tokens`, `accepted_tokens`, `mean_target_width`, `survival_per_pos`, raw `per_pos_counts` with zero deltas preserved, `metrics_label`); `summarize.py` aggregates per-position survivals EXACTLY as `sum(counts[i])/sum(verification_steps)` (steps-weighted, never equal-weight) and renders P(A=k) distributions (never chain-multiplied); T0 captures every op's real exit code (139 without "FAIL" text still stops); results in `results/YYYY-MM-DD/<run>/` (dry run verified: T0–T10 in ~1 s) |
 | `prompts/` | CODING-1 (Python), CODING-2 (C++), EDIT, JSON, AGENT, PROSE |
-| `build-verification/` | CMakeCache of the TheRock build, VGPR/LDS/scratch table of every gfx906 kernel |
+| `tests/static-tests.sh` | offline static battery: bash -n, py_compile, Prometheus fixture, survival math, run-name rejection, verify-isa multi-ELF, record_cap, contract greps |
+| `build-verification/` | VGPR/LDS/scratch table of every gfx906 kernel (the TSV `verify-isa` defaults); `disassembly/` (generated) |
 
 ---
 
@@ -139,7 +147,7 @@ Source: `ggml_cuda_should_use_mmvq`, VEGA20 block (alex b19fed0a), plus the wide
 | Q4_K (other models) | gfx906 GEMV | generic | generic | generic | generic | **MMQ** | MMQ | MMQ | MMQ |
 | IQ4_XS (other models) | generic | … | | | | | | ≤8 | MMQ |
 
-The verify batch for MTP n-max 3 is 4 columns (1 + 3). ngram-mod can push it up to 8 or more. Above 8 it falls into the **MMQ valley** (~400 µs per 4096×14336 against 104 µs at n=8). That is why `--spec-draft-n-max` above 7 makes no sense on this model without a separate ngram cap. T3 measures this.
+The verify batch for MTP n-max 3 is 4 columns (1 + 3). ngram-mod can push it up to 8 or more. Above 8 it falls into the **MMQ valley** (~400 µs per 4096×14336 against 104 µs at n=8). That is why `--spec-draft-n-max` above 7 makes no sense on this model without a separate ngram cap. **T3-SYNTHETIC-NCOL** (test id T3) measures the n-column cost curve — it characterizes GGML/GEMV/MMQ width cost, it does **not** measure MTP verify latency.
 
 ## 5. Dispatch map tensor → dispatch → kernel (Qwen3.8-27B Q4_0, decode/verify n ≤ 8)
 
@@ -255,10 +263,10 @@ MODERN is the fallback path and the long-term one. STABLE gives comparability wi
 
 Stock is **225 W**; no OC and no clock or voltage changes.
 
-1. Before every run: `./power.sh status` → cap must be 225 W. If not: `sudo ./power.sh stock`.
-2. During a run: 1 s monitor (`benchmark-mi50.sh` runs it by itself), saved as `power_*.csv`.
+1. Before every run: `./power.sh status` → cap must be 225 W. If not: `sudo ./power.sh stock`. `./preflight.sh` fails outside 220–226 W.
+2. During a run: 1 s monitor (`benchmark-mi50.sh` runs it by itself), saved as `power_*.csv`. **The actual cap is recorded before every test group** into `power_caps.csv` — and a real benchmark now **FAILs (aborts)** if the cap is unreadable or outside `POWER_CAP_MIN..MAX` (220–226 W); the only override is an explicit `ALLOW_POWER_MISMATCH=1` (never the default). `summarize.py` never aggregates runs with different caps (separate sections + warning).
 3. Numbers are comparable only at the same cap. alex measured that 125→225 W gives +22% decode, so a run at a different cap is invalid.
-4. Abort if Tj > 95 °C. Note that at 225 W decode sits at ~220 W / 1701 MHz, so the card is power-limited.
+4. **Abort if Tj > 95 °C — implemented, not just commented:** the benchmark-side watchdog samples junction temp every second; on breach it terminates the server AND the benchmark, writes `INVALID_THERMAL` into the run dir, and `summarize.py` marks the run partial/invalid. `power.sh monitor` has the same abort (`FILE.INVALID_THERMAL`, exit 95). Threshold: `TEMP_MAX_C` (default 95). Note that at 225 W decode sits at ~220 W / 1701 MHz, so the card is power-limited.
 
 ## 15. Stages (each with its own benchmark; stop as soon as the target is met)
 
@@ -270,7 +278,7 @@ Stock is **225 W**; no OC and no clock or voltage changes.
 | **2** | 0002 server: n_max per request / separate ngram cap | (same build) | T7 | e.g. `mtp2_ngram64` beats `mtp3` on EDIT/AGENT (lots of repetition) without losing on CODING |
 | **3** | DPP (P07) | `golden-dpp` | T0, T2, T6 | ≥ +1.5% effective on coding, 0 test FAILs, T10 determinism OK |
 | 4 | only when changing to K-quants: furnace repack + Q4_K cutover | — | T1, T2 | n/a for Q4_0 |
-| 5 | snapshot ring analysis, Q8_1 cache (mx), DFlash2 once n≈8 verify gets faster | — | T3 profile | only if a profile shows > 5% there |
+| 5 | snapshot ring analysis, Q8_1 cache (mx), DFlash2 once n≈8 verify gets faster | — | `PROFILE=1` trace | only if a profile shows > 5% there |
 
 ## 16. MTP policy
 
@@ -285,7 +293,8 @@ Stock is **225 W**; no OC and no clock or voltage changes.
 
   Real-code acceptance so far: median 0.59, so depth 3. For reference, alex measured at depth 2/3/4: 50.0/53.1/52.9 on code, 47.3 on prose.
 - **Logging:** the `-lv 4` server trace gives `draft acceptance`, `mean len`, and `acc per pos` for each slot. It goes to `acc_per_pos.csv`. The API `timings.draft_n` / `draft_n_accepted` goes into each request row.
-- **Verify latency:** T3 measures step time at n=1..16. `ms_per_verify_est` comes from each request.
+- **T3 is NOT the MTP verification measurement.** T3 = **T3-SYNTHETIC-NCOL**: `llama-bench -p N -n 0` characterizes the synthetic n-column GGML/GEMV/MMQ cost for n=1..16 (width cost curve). Keep it — it is useful — but never report it as actual MTP verification latency.
+- **Real MTP verification measurement (T5/T6/T7):** per request the harness records `draft_n`, `draft_n_accepted`, acceptance, total `predicted_ms`, wall time and TTFT; per config it records acceptance per position (server trace) and the target batch width distribution. If the exact target verification time is not directly exposed by the server, derived values (`verify_steps_EST`, `ms_per_verify_EST`, batch-width distribution) are labeled **ESTIMATE** — `predicted_ms / verify_steps_EST` is never called "measured verify latency" (it contains draft + verify + overhead). With `PROFILE=1` the kernel trace/profile of a short fixed workload is saved alongside (`profile/`).
 - **Effective TPS** = predicted_n / predicted_ms. This is the only success metric.
 
 | Level | Effective tok/s |
@@ -305,6 +314,7 @@ Order matters: correctness, then references, then golden, then variants. Same po
 sudo ./power.sh stock && ./power.sh status          # 225 W
 ./install-rocm.sh check
 ./build.sh alex-exact && ./build.sh upstream && ./build.sh golden && ./build.sh golden-upmmq && ./build.sh golden-dpp
+./preflight.sh                                      # must end READY_FOR_MI50_BENCHMARK (needs the binaries)
 M=/models/Qwen3.8-27B-Q4_0.gguf; B=~/mi50-builds
 ./benchmark-mi50.sh A0-alex-exact  $B/alex-exact/build   $M T0,T2,T3,T4,T6
 ./benchmark-mi50.sh A0-upstream    $B/upstream/build     $M T0,T2,T3,T4,T6
@@ -312,6 +322,8 @@ M=/models/Qwen3.8-27B-Q4_0.gguf; B=~/mi50-builds
 ./benchmark-mi50.sh A1b-upmmq      $B/golden-upmmq/build $M T0,T1,T2,T8
 ./benchmark-mi50.sh A3-dpp         $B/golden-dpp/build   $M T0,T2,T6,T10
 ```
+
+Every `benchmark-mi50.sh` invocation re-runs the strict preflight first (no file edits needed: `ALLOW_MODEL_MISMATCH=1` is the sanctioned model-sha override; `ALLOW_APPEND=1` explicitly allows appending to an existing run dir — the default is FAIL; `ALLOW_POWER_MISMATCH=1` explicitly allows a non-stock power cap — the default is FAIL; `NUMA_MODE=auto|off` picks the binding; `PROFILE=1` adds the short rocprofv3 workload).
 
 | Comparison | Metric | Decision |
 |---|---|---|
@@ -349,6 +361,8 @@ Then bisect: take 42916d83 upstream without 0001, check whether the qwen4exp/GDN
 The upstream arm with no wide GEMV shows the patches' real value on day 1.
 
 ## 20. Build verification (in this environment, no GPU)
+
+Full write-up: **`BUILD-VERIFICATION.md`**. ISA disassembly artifacts: **`build-verification/disassembly/`** (generated by `verify-isa.sh` at the end of every `./build.sh`; q4_0_breit n=1/4/8, q5_K_breit, q6_K_breit; confirms gfx906 ISA + scratch=0 for defaults; no performance claims without hardware).
 
 - **Forward-port and SHA:** `git am` of the 3 patches on 42916d83 gives **844e42b4b37a…** every time (checked twice).
 - **CPU compile check:** the host code for the server/speculative changes compiles (GCC 14.2).
