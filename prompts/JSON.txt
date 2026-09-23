@@ -1,0 +1,10 @@
+Return ONLY a JSON object (no prose, no markdown fences) that matches this schema, describing a fictional but realistic microservice deployment with exactly 6 services:
+{
+  "cluster": string,
+  "region": string,
+  "services": [ { "name": string, "image": string, "replicas": integer, "cpu_millicores": integer, "memory_mb": integer,
+                  "ports": [integer], "env": { string: string }, "depends_on": [string],
+                  "healthcheck": { "path": string, "interval_s": integer, "timeout_s": integer } } ],
+  "ingress": [ { "host": string, "path": string, "service": string, "port": integer } ]
+}
+Every depends_on entry must refer to another service in the list, and every ingress service/port must exist.

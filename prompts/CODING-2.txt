@@ -1,0 +1,9 @@
+Implement in modern C++20 a header-only, thread-safe LRU cache:
+template <class Key, class Value, class Hash = std::hash<Key>> class LruCache
+- constructor takes a capacity; `std::optional<Value> get(const Key&)`, `void put(Key, Value)`, `bool erase(const Key&)`, `size()`, `clear()`
+- O(1) average for get/put using std::list + std::unordered_map with iterators
+- use std::shared_mutex; get() must still update recency correctly (explain the locking choice in a short comment)
+- an eviction callback `std::function<void(const Key&, Value&&)>` invoked outside the lock
+- no raw new/delete, exception-safe put()
+Then write a GoogleTest file with at least 8 tests including a multi-threaded stress test.
+Output only the two files.

@@ -1,0 +1,8 @@
+Write a complete, production-quality Python 3.12 module `ratelimit.py` implementing an asyncio token-bucket rate limiter.
+Requirements:
+- class `TokenBucket(rate: float, capacity: int, *, clock=time.monotonic)` with `async acquire(n: int = 1)` and non-blocking `try_acquire(n: int = 1) -> bool`
+- fair FIFO ordering of waiters, cancellation-safe (a cancelled waiter must not leak tokens)
+- a decorator `@rate_limited(bucket, cost=1)` for async functions
+- full type hints, docstrings, and no third-party dependencies
+- then write pytest tests (pytest-asyncio) covering: burst up to capacity, refill timing with a fake clock, FIFO fairness, cancellation, and invalid arguments.
+Output only the code: first `ratelimit.py`, then `test_ratelimit.py`.

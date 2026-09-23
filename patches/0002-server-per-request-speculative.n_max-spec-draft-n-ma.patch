@@ -1,0 +1,216 @@
+From 4f606f11eedf9cc1d1c9a2e4a3e76b6c77feaf26 Mon Sep 17 00:00:00 2001
+From: mi50 <mi50@local>
+Date: Wed, 23 Sep 2026 14:12:28 +0000
+Subject: [PATCH 2/3] server: per-request speculative.n_max,
+ --spec-draft-n-max-default, --spec-draft-n-max-ngram (alex4300
+ db3ede92/c4f3d550/4b3173a8, forward-ported to pos0 API)
+
+---
+ common/arg.cpp                  | 20 ++++++++++++++++++++
+ common/common.h                 |  2 ++
+ common/speculative.cpp          | 23 +++++++++++++++++------
+ common/speculative.h            |  3 +++
+ tools/server/server-context.cpp | 29 +++++++++++++++++++++++------
+ tools/server/server-schema.cpp  | 17 +++++++++++++----
+ 6 files changed, 78 insertions(+), 16 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63e342776..c3295c0de 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4142,6 +4142,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.draft.n_max = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
++    add_opt(common_arg(
++        {"--spec-draft-n-max-default"}, "N",
++        string_format("server: draft length for requests that do not send \"speculative.n_max\" (default: %d = same as --spec-draft-n-max, which stays the upper limit)", params.speculative.draft.n_max_default),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_max_default = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_DEFAULT"));
++    add_opt(common_arg(
++        {"--spec-draft-n-max-ngram"}, "N",
++        string_format("server: separate draft cap for the n-gram drafters (ngram-mod, ngram-cache, ...) so a model drafter can stay shallow while n-gram drafts go deep (default: %d = capped by --spec-draft-n-max like every drafter)", params.speculative.draft.n_max_ngram),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_max_ngram = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_NGRAM"));
+     add_opt(common_arg(
+         {"--spec-draft-n-min"}, "N",
+         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+diff --git a/common/common.h b/common/common.h
+index 7afc266ac..c0de89c66 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -324,6 +324,8 @@ struct common_params_model {
+ // draft-model-based speculative decoding parameters
+ struct common_params_speculative_draft {
+     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
++    int32_t n_max_default = 0; // server: draft length for requests without "speculative.n_max" (0 = n_max); n_max stays the cap
++    int32_t n_max_ngram   = 0; // server: separate draft cap for the n-gram drafters (ngram-mod, ngram-cache, ...); 0 = capped by n_max like everything else
+     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+ 
+     float p_split = 0.1f; // speculative decoding split probability
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535..50b0ca070 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -810,7 +810,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if ((params.n_max <= (int) result.size()) ||
++                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+@@ -1697,7 +1698,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if ((params.n_max <= (int) result.size()) ||
++                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+@@ -2849,10 +2851,19 @@ void common_speculative_draft(common_speculative * spec) {
+             if (dp.drafting && !result.empty()) {
+                 dp.drafting = false;
+ 
+-                if (dp.n_max > 0) {
+-                    if (!result.empty() && (int) result.size() > dp.n_max) {
+-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
+-                        result.resize(dp.n_max);
++                // n-gram drafters get their own cap when the caller set one (server: --spec-draft-n-max-ngram),
++                // so a model drafter (MTP, EAGLE3, ...) can stay shallow while n-gram drafts go deep
++                const bool is_ngram = impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE  ||
++                                      impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K   ||
++                                      impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V ||
++                                      impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD     ||
++                                      impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
++                const int32_t n_cap = (is_ngram && dp.n_max_ngram > 0) ? dp.n_max_ngram : dp.n_max;
++
++                if (n_cap > 0) {
++                    if (!result.empty() && (int) result.size() > n_cap) {
++                        SPC_DBG("truncating draft to %d tokens\n", n_cap);
++                        result.resize(n_cap);
+                     }
+                 }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index c968750e2..f553af3c1 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -61,6 +61,9 @@ struct common_speculative_draft_params {
+     // can be used to constraint the max draft based on the remaining context size
+     int32_t n_max = -1;
+ 
++    // separate cap for the n-gram drafters (ngram-*); -1 = use n_max
++    int32_t n_max_ngram = -1;
++
+     llama_pos   pos0;
+     llama_token id_last;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 274af9b05..66f9875a8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -496,11 +496,23 @@ struct server_slot {
+             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+         }
+ 
++        n_draft_limit = n_draft_max;
++
++        // Entwurfslaenge je Anfrage ("speculative": {"n_max": N}); ohne Angabe steht hier
++        // der Serverwert, der zugleich die Obergrenze bleibt (die Drafter pruefen params.n_max).
++        if (task->params.speculative.draft.n_max > 0) {
++            n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
++        }
++
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+ 
+         return n_draft_max;
+     }
+ 
++    // Grenze aus Kontext und Restlaenge, wie sie get_n_draft_max zuletzt berechnet hat (ohne Anfrage-Kappung);
++    // Grundlage fuer die getrennte n-gram-Kappung (--spec-draft-n-max-ngram)
++    mutable int n_draft_limit = 0;
++
+     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
+     void handle_last_sampled_token(server_batch & batch) {
+         bool add_ok = true;
+@@ -3025,13 +3037,18 @@ private:
+ 
+                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+ 
++                        // --spec-draft-n-max-ngram: eigene Kappung fuer die n-gram-Drafter, nur durch Kontext und Restlaenge begrenzt
++                        const int n_max_ngram = params_base.speculative.draft.n_max_ngram > 0
++                            ? std::min(slot.n_draft_limit, params_base.speculative.draft.n_max_ngram) : -1;
++
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+-                            /* .drafting = */ true,
+-                            /* .n_max    = */ n_draft_max,
+-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
+-                            /* .id_last  = */ slot.sampled,
+-                            /* .prompt   = */ &slot.spec_prompt,
+-                            /* .result   = */ &slot.spec_draft,
++                            /* .drafting    = */ true,
++                            /* .n_max       = */ n_draft_max,
++                            /* .n_max_ngram = */ n_max_ngram,
++                            /* .pos0        = */ slot.prompt.tokens.pos_next(),
++                            /* .id_last     = */ slot.sampled,
++                            /* .prompt      = */ &slot.spec_prompt,
++                            /* .result      = */ &slot.spec_draft,
+                         };
+ 
+                         drafting.push_back(&slot);
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 27ecafb7a..ff51eb5e1 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -194,13 +194,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     // Speculative decoding params
+     //
+ 
+-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
+-#if 0
+-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
++    // Je Anfrage einstellbar ist nur die Entwurfslaenge (gfx906-Zweig, 2026-09-02): der
++    // Harness schickt "speculative": {"n_max": 4}, der Chat bleibt beim Serverwert. Nach oben
++    // begrenzt der Serverwert (--spec-draft-n-max), weil Stapel und Drafter darauf ausgelegt
++    // sind; siehe server_slot::get_n_draft_max und die dp.n_max-Pruefungen in speculative.cpp.
+     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+         ->set_hard_limits(0, INT32_MAX)
+-        ->set_desc("Maximum number of tokens to draft during speculative decoding"));
++        ->set_desc("Maximum number of tokens to draft during speculative decoding (capped by the server value)"));
+ 
++    // TODO: to keep things simple, we disable speculative parameter adjustments for now
++#if 0
++    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Minimum number of draft tokens to use for speculative decoding");
+@@ -526,6 +530,11 @@ task_params eval_llama_cmpl_schema(
+     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
+     params.sampling      = params_base.sampling;
+     params.speculative   = params_base.speculative;
++    // Vorgabe je Anfrage kann unter der Obergrenze liegen (--spec-draft-n-max-default): dann
++    // bekommt ein Client, der "speculative.n_max" nicht setzen kann, den kleineren Wert.
++    if (params_base.speculative.draft.n_max_default > 0) {
++        params.speculative.draft.n_max = std::min(params_base.speculative.draft.n_max_default, params_base.speculative.draft.n_max);
++    }
+     params.n_keep        = params_base.n_keep;
+     params.n_predict     = params_base.n_predict;
+     params.n_cache_reuse = params_base.n_cache_reuse;
+-- 
+2.47.3
+

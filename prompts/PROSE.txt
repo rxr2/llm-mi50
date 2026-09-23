@@ -1,0 +1,1 @@
+Write a 600-word essay in English for a general audience about why old datacenter GPUs remain useful for local AI inference, covering memory bandwidth versus compute, power efficiency trade-offs, software support risks, and when buying newer hardware is the better choice. Use plain paragraphs, no lists, no headings.

@@ -1,0 +1,36 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Model and generated result artifacts
+*.gguf
+results/
+**/results/
+
+# Build outputs and caches
+build/
+**/build/
+build-verification/CMakeCache-*.txt
+**/CMakeCache.txt
+**/CMakeFiles/
+.cache/
+**/.cache/
+rocm-cache/
+**/rocm-cache/
+*.log
+__pycache__/
+**/__pycache__/
+*.py[cod]
+node_modules/
+**/node_modules/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
