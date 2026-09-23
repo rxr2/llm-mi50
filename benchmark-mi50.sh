@@ -33,7 +33,9 @@
 #   summary.md        generated at the end
 #
 # Tests
-#   T0  provenance + correctness gate (test-backend-ops MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET)
+#   T0  provenance + correctness gate (test-backend-ops MUL_MAT, MUL_MAT_ID,
+#       FLASH_ATTN_EXT, GATED_DELTA_NET, MUL_MAT_VEC_FUSION — same strict ops
+#       as the build gate; any FAIL stops the run)
 #   T1  kernel micro-bench: MUL_MAT for the model's shapes, n = 1..16 (MMVQ/MMQ cutover table)
 #   T2  llama-bench native: pp512, pp2048, tg128 (prefill + native decode)
 #   T3-SYNTHETIC-NCOL (test id: T3)
@@ -45,10 +47,13 @@
 #   T5  server draft-mtp,ngram-mod n-max 2
 #   T6  server draft-mtp,ngram-mod n-max 3   (golden)
 #   T7  server draft-mtp,ngram-mod n-max 4 ; + draft-mtp only n-max 3 ; + n-max 2 / ngram 64
-#         -> T5/T6/T7 carry the REAL MTP verification measurements: draft_n,
-#            draft_n_accepted, acceptance per position, target batch width
-#            distribution (ESTIMATE where derived), total predicted_ms, wall time,
-#            and the kernel trace when PROFILE=1 was used.
+#         -> T5/T6/T7 carry the REAL MTP verification measurements: EXACT
+#            BEFORE/AFTER /metrics Prometheus counter deltas per request
+#            (verification_steps, draft_tokens, accepted_tokens,
+#            mean_*_per_step, mean_target_width = 1 + draft/step,
+#            per-position survivals r[i]=P(A>=i+1)), plus API draft_n /
+#            draft_n_accepted, predicted_ms, wall time, and the kernel trace
+#            when PROFILE=1 was used.
 #   T8  long context 8k / 32k / 64k prompts built with the Qwen/llama tokenizer
 #       (server /tokenize endpoint — NO word-count estimates); the ACTUAL prompt
 #       token count is recorded (prompt_tokens.csv + requests.csv prompt_n);
@@ -81,7 +86,24 @@ TEMP_MAX_C="${TEMP_MAX_C:-95}"
 ALLOW_MODEL_MISMATCH="${ALLOW_MODEL_MISMATCH:-0}"
 POWER_CAP_MIN="${POWER_CAP_MIN:-220}"
 POWER_CAP_MAX="${POWER_CAP_MAX:-226}"
-SMI="${SMI:-rocm-smi}"
+ALLOW_APPEND="${ALLOW_APPEND:-0}"                  # run isolation (5): default FAIL on existing data
+ALLOW_POWER_MISMATCH="${ALLOW_POWER_MISMATCH:-0}"  # power override (6): explicit env only
+
+# ---- run isolation (5): an existing run dir WITH benchmark data must FAIL
+if [ "$ALLOW_APPEND" != 1 ] && [ -d "$OUT" ]; then
+  has_data=0
+  for m in requests.csv meta.json power_caps.csv cmdlines.txt summary.md \
+           acc_per_pos.csv INVALID_THERMAL bench.log; do
+    [ -e "$OUT/$m" ] && has_data=1
+  done
+  compgen -G "$OUT/T[0-9]*" >/dev/null && has_data=1
+  [ -d "$OUT/profile" ] && has_data=1
+  if [ "$has_data" = 1 ]; then
+    echo "ERROR: run dir $OUT already contains benchmark data — refusing to append a second experiment." >&2
+    echo "       Pick a new run name, or explicitly ALLOW_APPEND=1 to continue anyway." >&2
+    exit 1
+  fi
+fi
 
 export HIP_VISIBLE_DEVICES="$GPU"
 export GPU            # meta.json collector reads it via os.environ
@@ -91,6 +113,15 @@ LOG="$OUT/bench.log"
 log() { echo "[$(date +%T)] $*" | tee -a "$LOG" >&2; }
 run() { log "+ $*"; [ "$DRY_RUN" = 1 ] && return 0; "$@"; }
 want() { [[ ",$TESTS," == *",$1,"* ]]; }
+
+# Shared ROCm resolution (3) — same rocm-env.sh preflight/build source, so a
+# READY from preflight guarantees these tool paths exist for the benchmark.
+# shellcheck source=rocm-env.sh
+. "$HERE/rocm-env.sh"
+rocm_env_resolve || true     # a failure surfaces as preflight NOT_READY reasons below
+SMI="${SMI:-rocm-smi}"
+[ "$SMI" = rocm-smi ] && SMI="${ROCM_SMI:-rocm-smi}"
+ROCPROF="${ROCPROF:-${ROCPROFV3:-rocprofv3}}"
 
 # ---------------------------------------------------------------- preflight (STRICT, before ANY benchmark)
 PREFLIGHT_ARGS=(--build "$BUILD" --model "$MODEL" --report "$OUT/preflight")
@@ -126,15 +157,29 @@ numa_setup() {
 numa_setup
 NPFX="${NUMA_RUN[*]:-}"
 
-# ---------------------------------------------------------------- power cap per test group (item 5)
+# ---------------------------------------------------------------- power cap per test group (5/6: FAIL outside stock range)
 record_cap() { # $1 = test, $2 = config
   [ "$DRY_RUN" = 1 ] && return 0
   local f="$OUT/power_caps.csv" cap
   [ -f "$f" ] || echo "test,config,power_cap_w,ts" > "$f"
   cap=$($SMI -d "$GPU" --showmaxpower 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | tail -1 || true)
   echo "$1,$2,${cap:-unknown},$(date -Is)" >> "$f"
-  if [ -n "$cap" ] && ! awk -v c="$cap" -v lo="$POWER_CAP_MIN" -v hi="$POWER_CAP_MAX" 'BEGIN{exit !(c>=lo && c<=hi)}'; then
-    log "WARNING: test group $1/$2 runs at power cap ${cap} W (stock range ${POWER_CAP_MIN}-${POWER_CAP_MAX} W)"
+  if [ -z "$cap" ]; then
+    if [ "$ALLOW_POWER_MISMATCH" = 1 ]; then
+      log "WARNING: test group $1/$2 power cap unreadable — ALLOWED by ALLOW_POWER_MISMATCH=1"
+    else
+      log "ERROR: test group $1/$2 cannot read the power cap via $SMI — aborting real benchmark"
+      log "       (override: ALLOW_POWER_MISMATCH=1 — never the default)"
+      exit 1
+    fi
+  elif ! awk -v c="$cap" -v lo="$POWER_CAP_MIN" -v hi="$POWER_CAP_MAX" 'BEGIN{exit !(c>=lo && c<=hi)}'; then
+    if [ "$ALLOW_POWER_MISMATCH" = 1 ]; then
+      log "WARNING: test group $1/$2 runs at power cap ${cap} W (stock ${POWER_CAP_MIN}-${POWER_CAP_MAX} W) — ALLOWED by ALLOW_POWER_MISMATCH=1"
+    else
+      log "ERROR: test group $1/$2 power cap ${cap} W outside stock range ${POWER_CAP_MIN}-${POWER_CAP_MAX} W — aborting"
+      log "       (override: ALLOW_POWER_MISMATCH=1 — never the default)"
+      exit 1
+    fi
   fi
 }
 
@@ -213,11 +258,14 @@ srv_stop() {
 trap 'mon_stop; srv_stop' EXIT
 
 # one request -> one CSV row in requests.csv (+ raw json).
-# A WARM-UP request (9th arg = 1) NEVER writes to requests.csv — the raw json
-# goes to a warmup_-prefixed file instead. No row is ever deleted afterwards
-# (fixes the old `sed -i '$d'` deletion bug).
+# A WARM-UP request (9th arg = 1) NEVER writes to requests.csv and takes NO
+# /metrics snapshots — the raw json goes to a warmup_-prefixed file instead.
+# A MEASURED request snapshots /metrics BEFORE and AFTER and stores counter
+# DELTAS (exact verification_steps / draft_tokens / accepted_tokens /
+# per-position survivals — spec_metrics.py). Snapshot failure ABORTS (set -e).
+# No row is ever deleted afterwards (fixes the old `sed -i '$d'` bug).
 REQ_CSV="$OUT/requests.csv"
-[ -f "$REQ_CSV" ] || echo "test,config,workload,rep,seed,temp,ctx,n_max,prompt_n,prompt_ms,prefill_tps,predicted_n,predicted_ms,effective_tps,draft_n,draft_accepted,acceptance,verify_steps_EST,ms_per_verify_EST,wall_s,ttft_ms,output_sha256,verify_latency_label" > "$REQ_CSV"
+[ -f "$REQ_CSV" ] || echo "test,config,workload,rep,seed,temp,ctx,n_max,prompt_n,prompt_ms,prefill_tps,predicted_n,predicted_ms,effective_tps,draft_n,draft_accepted,acceptance,verification_steps,draft_tokens,accepted_tokens,mean_draft_tokens_per_step,mean_accepted_tokens_per_step,mean_target_width,survival_per_pos,ms_per_spec_step_EST,wall_s,ttft_ms,output_sha256,metrics_label" > "$REQ_CSV"
 request() { # test config workload rep n_max [n_predict] [temp] [prompt_file] [warmup=0]
   local t="$1" cfg="$2" wl="$3" rep="$4" nmax="$5" np="${6:-$NPRED}" temp="${7:-$TEMP}" pf="${8:-$PROMPTS/$3.txt}" warm="${9:-0}"
   local seed=$((42 + rep)) rawname="${cfg}_${wl}_r${rep}.json"
@@ -225,15 +273,23 @@ request() { # test config workload rep n_max [n_predict] [temp] [prompt_file] [w
   local raw="$OUT/$t/raw/$rawname"
   mkdir -p "$(dirname "$raw")"
   [ "$DRY_RUN" = 1 ] && { log "request $t $cfg $wl r$rep seed=$seed n_max=$nmax warmup=$warm"; return 0; }
-  python3 - "$PORT" "$pf" "$np" "$temp" "$seed" "$raw" "$t" "$cfg" "$wl" "$rep" "$CTX" "$nmax" "$warm" >> "$REQ_CSV" <<'EOF'
+  python3 - "$HERE" "$PORT" "$pf" "$np" "$temp" "$seed" "$raw" "$t" "$cfg" "$wl" "$rep" "$CTX" "$nmax" "$warm" >> "$REQ_CSV" <<'EOF'
 import sys, json, time, hashlib, urllib.request
-port, pf, npred, temp, seed, raw, t, cfg, wl, rep, ctx, nmax, warm = sys.argv[1:]
+here = sys.argv[1]
+(port, pf, npred, temp, seed, raw, t, cfg, wl, rep, ctx, nmax, warm) = sys.argv[2:]
+sys.path.insert(0, here)
+import spec_metrics as sm   # Prometheus parser + survival math (shared, unit-tested)
 prompt = open(pf, encoding="utf-8").read()
 body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": int(npred), "temperature": float(temp),
         "top_p": 0.95, "top_k": 20, "seed": int(seed), "stream": True, "cache_prompt": False,
         "chat_template_kwargs": {"enable_thinking": False}}
 req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
                              headers={"Content-Type": "application/json"})
+# BEFORE snapshot of the exact spec_decode counters (measured requests only;
+# warm-up skips snapshots entirely)
+mb = None
+if warm != "1":
+    mb = sm.fetch_metrics(port)
 t0 = time.time(); ttft = None; text = []; timings = {}
 with urllib.request.urlopen(req, timeout=1800) as r:
     for line in r:
@@ -251,36 +307,43 @@ wall = time.time() - t0
 out = "".join(text)
 json.dump({"timings": timings, "output": out, "wall_s": wall, "ttft_ms": ttft}, open(raw, "w"), indent=1)
 if warm == "1":
-    sys.exit(0)   # warm-up: raw saved, requests.csv untouched
+    sys.exit(0)   # warm-up: raw saved, no snapshots, requests.csv untouched
+# AFTER snapshot + exact deltas (this IS the verification measurement)
+ma = sm.fetch_metrics(port)
+d = sm.counter_delta(mb, ma)
+means = sm.means_from_delta(d) or {}
+surv = sm.survival_from_delta(d)
 g = lambda k: timings.get(k, 0) or 0
 pn, pms, dn, da = g("predicted_n"), g("predicted_ms"), g("draft_n"), g("draft_n_accepted")
 eff = pn / pms * 1000 if pms else 0
 acc = da / dn if dn else 0
-nm = int(nmax) if nmax not in ("", "0") else 0
-# verify steps (ESTIMATE): every speculative step drafts up to n_max tokens
-# -> steps ~= draft_n / n_max. This is NOT a measured verify latency; the
-# exact count is only visible in the server trace ("mean len").
-if nm and dn:
-    steps, mspv = dn / nm, (pms / (dn / nm) if dn else 0)
-    label = "ESTIMATE: predicted_ms/verify_steps_EST (draft+verify+overhead; NOT a measured verify latency)"
-elif nm:
-    steps, mspv = "", ""
-    label = "speculative configured but draft_n=0 (no verify steps executed)"
-elif pn:
-    steps, mspv = pn, (pms / pn if pn else 0)
-    label = "native: predicted_ms/predicted_n (no speculative verify step)"
+steps = int(d["verification_steps"])
+dtok = int(d["draft_tokens"])
+atok = int(d["accepted_tokens"])
+mdraft = means.get("mean_draft_tokens_per_step", "")
+macc = means.get("mean_accepted_tokens_per_step", "")
+width = means.get("mean_target_width", "")
+ms_step = (pms / steps) if steps and pms else ""
+surv_field = ";".join(f"{x:.4f}" for x in surv)   # ';'-joined: CSV-safe
+if steps > 0:
+    label = "exact: /metrics spec_decode counter deltas"
+elif dn:
+    label = "spec configured; spec_decode counters idle"
 else:
-    steps, mspv = "", ""
-    label = "n/a"
+    label = "native (spec_decode counters idle)"
 print(",".join(map(str, [t, cfg, wl, rep, seed, temp, ctx, nmax, g("prompt_n"), round(g("prompt_ms"), 2),
-      round(g("prompt_per_second"), 2), pn, round(pms, 2), round(eff, 3), dn, da, round(acc, 4), 
-      round(steps, 1) if steps != "" else "",
-      round(mspv, 3) if mspv != "" else "",
+      round(g("prompt_per_second"), 2), pn, round(pms, 2), round(eff, 3), dn, da, round(acc, 4),
+      steps, dtok, atok,
+      round(mdraft, 3) if mdraft != "" else "",
+      round(macc, 3) if macc != "" else "",
+      round(width, 4) if width != "" else "",
+      surv_field,
+      round(ms_step, 3) if ms_step != "" else "",
       round(wall, 3), round(ttft or 0, 1), hashlib.sha256(out.encode()).hexdigest()[:16], label])))
 EOF
   [ "$warm" = 1 ] && return 0
   check_thermal
-  tail -1 "$REQ_CSV" | awk -F, '{printf "   -> %s %s %s: %s tok/s eff, acc %s, ttft %s ms\n",$1,$2,$3,$14,$17,$21}' | tee -a "$LOG" >&2
+  tail -1 "$REQ_CSV" | awk -F, '{printf "   -> %s %s %s: %s tok/s eff, acc %s, ttft %s ms\n",$1,$2,$3,$14,$17,$27}' | tee -a "$LOG" >&2
 }
 
 # per-position acceptance + mean len from the server trace log (-lv 4)
@@ -313,11 +376,12 @@ server_suite() { # test cfg n_max spec_args...
 if [ "$PROFILE" = 1 ]; then
   mkdir -p "$OUT/profile"
   record_cap PROFILE short-workload
+  mon_start "$OUT/profile/power.csv"   # (7) PROFILE is a meaningful GPU load — monitor it
   log "PROFILE=1: short fixed workload under rocprofv3, HIP graphs OFF (kernel trace + names/durations/count + raw files)"
   echo "HIP graphs: DISABLED for the profiled workload (rocprofv3 requires it)" > "$OUT/profile/notes.txt"
   echo "workload: llama-bench -p 128,512 -n 64 -r 1 (short, fixed — NOT the full suite)" >> "$OUT/profile/notes.txt"
   rcmd=("$BIN/llama-bench" -m "$MODEL" -ngl 99 -fa on -p 128,512 -n 64 -r 1 -o csv)
-  pcmd=(rocprofv3 --kernel-trace --output-format csv --output-directory "$OUT/profile/raw"
+  pcmd=("$ROCPROF" --kernel-trace --output-format csv --output-directory "$OUT/profile/raw"
         --output-name kernel_trace --)
   if [ ${#NUMA_RUN[@]} -gt 0 ]; then pcmd+=("${NUMA_RUN[@]}"); fi
   pcmd+=("${rcmd[@]}")
@@ -325,10 +389,12 @@ if [ "$PROFILE" = 1 ]; then
   if [ "$DRY_RUN" = 1 ]; then
     log "+ GGML_CUDA_DISABLE_GRAPHS=1 ${pcmd[*]}"
   else
-    command -v rocprofv3 >/dev/null 2>&1 || { log "PROFILE=1 but rocprofv3 not found in PATH/ROCm"; exit 1; }
+    command -v "$ROCPROF" >/dev/null 2>&1 || { log "PROFILE=1 but rocprofv3 not found ($ROCPROF)"; mon_stop; exit 1; }
     mkdir -p "$OUT/profile/raw"
     GGML_CUDA_DISABLE_GRAPHS=1 "${pcmd[@]}" > "$OUT/profile/llama-bench.out" 2> "$OUT/profile/llama-bench.err" \
       || log "profile workload exited non-zero (see profile/llama-bench.err)"
+    mon_stop
+    check_thermal
     # kernel names / durations / count from the raw trace
     python3 - "$OUT/profile" <<'EOF'
 import csv, glob, os, sys
@@ -443,9 +509,13 @@ m = {
 json.dump(m, open(meta, "w"), indent=1)
 EOF
   }
-  for op in MUL_MAT MUL_MAT_ID FLASH_ATTN_EXT GATED_DELTA_NET; do
+  # thermal monitoring covers EVERY meaningful GPU-load benchmark (7), incl. T0/T1
+  mon_start "$OUT/T0/power.csv"
+  for op in MUL_MAT MUL_MAT_ID FLASH_ATTN_EXT GATED_DELTA_NET MUL_MAT_VEC_FUSION; do
     run bash -c "$NPFX '$BIN/test-backend-ops' test -o $op -b ROCm0 > '$OUT/T0/test_$op.txt' 2>&1; tail -3 '$OUT/T0/test_$op.txt'"
   done
+  mon_stop
+  check_thermal
   [ "$DRY_RUN" = 1 ] || ! grep -l "FAIL" "$OUT"/T0/test_*.txt >/dev/null 2>&1 || { log "CORRECTNESS FAIL — stopping"; exit 2; }
 fi
 
@@ -453,6 +523,7 @@ fi
 if want T1; then
   mkdir -p "$OUT/T1"
   record_cap T1 mul-mat-micro
+  mon_start "$OUT/T1/power.csv"
   # model shapes (k x m): qkv 5120x10240, gate 5120x6144, ffn_up/gate 5120x17408, ffn_down 17408x5120,
   # ssm_out 6144x5120 (Q5_K), attn_q 5120x12288, output 5120x248320 (Q6_K). Types present: q4_0 q4_1 q5_K q6_K q8_0.
   # test-backend-ops perf runs its built-in MUL_MAT grid; we filter to our types and n<=16.
@@ -463,6 +534,8 @@ if want T1; then
   for sw in GGML_MMVQ_Q4_BREIT_GFX906=0 GGML_MMVQ_Q5K_BREIT_GFX906=0 GGML_MMVQ_Q6K_BREIT_GFX906=0 GGML_MMVQ_Q41_BREIT_GFX906=0; do
     run bash -c "env $sw $NPFX '$BIN/test-backend-ops' perf -o MUL_MAT -b ROCm0 > '$OUT/T1/mul_mat_perf_${sw%%=*}_off.txt' 2>&1 || true"
   done
+  mon_stop
+  check_thermal
 fi
 
 # ================================================================= T2 native llama-bench
@@ -630,9 +703,13 @@ if want T9; then
   SRV_ENV="GGML_CUDA_DISABLE_GRAPHS=1" server_suite T9 graphs_off 3 --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3
   SRV_ENV=""; WORKLOADS="$WORKLOADS_SAVE"
   record_cap T9 native-bench
-  # native too: graphs matter most at n=1
+  # native too: graphs matter most at n=1 — and it is a meaningful GPU load,
+  # so the thermal monitor must cover it (7): not only suites/T2/T3
+  mon_start "$OUT/T9/power_native.csv"
   run bash -c "$NPFX '$BIN/llama-bench' -m '$MODEL' -ngl 99 -fa on -p 0 -n 128 -r 5 -o csv > '$OUT/T9/tg_graphs_on.csv' 2>/dev/null"
   run bash -c "GGML_CUDA_DISABLE_GRAPHS=1 $NPFX '$BIN/llama-bench' -m '$MODEL' -ngl 99 -fa on -p 0 -n 128 -r 5 -o csv > '$OUT/T9/tg_graphs_off.csv' 2>/dev/null"
+  mon_stop
+  check_thermal
 fi
 
 # ================================================================= T10 soak + determinism
@@ -652,8 +729,11 @@ if want T10; then
   check_thermal
   record_cap T10 greedy-native
   srv_start "$OUT/T10/server_native.log" || exit 1
+  mon_start "$OUT/T10/power_native.csv"   # native arm is a meaningful load too (7)
   for rep in 0 1; do request T10 greedy_native CODING-1 "$rep" 0 512 0; done
+  mon_stop
   srv_stop
+  check_thermal
   [ "$DRY_RUN" = 1 ] || grep -cE "error|ERROR|abort|hipError" "$OUT/T10/server.log" > "$OUT/T10/error_count.txt" || true
 fi
 

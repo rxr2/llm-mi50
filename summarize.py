@@ -8,17 +8,27 @@ timings), per workload, median over reps. Targets: native ~30, MTP 45-55,
 Semantics fixes (final harness pass):
   * T3 is T3-SYNTHETIC-NCOL: synthetic n-column GGML/GEMV/MMQ cost for
     n=1..16 (llama-bench -p N). It is NOT MTP verification latency.
-  * The REAL MTP verification measurements come from T5/T6/T7 (draft_n,
-    draft_n_accepted, acceptance per position, target batch width
-    distribution ESTIMATE, total predicted_ms, wall time).
-  * Derived per-step verify values are labeled ESTIMATE everywhere —
-    predicted_ms/verify_steps_EST is never called "measured verify latency".
+  * The REAL MTP verification measurements come from T5/T6/T7 as exact
+    BEFORE/AFTER `/metrics` Prometheus counter deltas (spec_metrics.py):
+    verification_steps, draft_tokens, accepted_tokens, mean_*_per_step,
+    mean_target_width = 1 + draft_tokens/verification_steps, and
+    per-position survivals r[i] = P(A>=i+1) (server acc-per-pos values —
+    UNCONDITIONAL survivals, NEVER chain-multiplied again).
+    Accepted-prefix distribution from survivals:
+    P(A=0)=1-r0, P(A=k)=r[k-1]-r[k], P(A=K)=r[K-1].
+    Means are exact per config (sums-based) — no invented width histogram,
+    no last-request-wins overwrites of acc_per_pos.csv rows.
+  * Derived per-step values are labeled EST —
+    predicted_ms/verification_steps (exact step count) is never called
+    "measured verify latency".
   * Runs (or test groups) with DIFFERENT power caps are NEVER aggregated
     together — they are rendered in separate sections.
   * INVALID_THERMAL marks the run as aborted/invalid at the top.
 """
 import csv, sys, statistics as st, os, json
 from collections import defaultdict
+
+import spec_metrics as sm   # Prometheus parsers + survival math (shared, unit-tested)
 
 run = sys.argv[1]
 rows = list(csv.DictReader(open(os.path.join(run, "requests.csv"))))
@@ -83,23 +93,11 @@ def nmax_of(r):
     except ValueError:
         return 0
 
-# ---------- target batch width distribution (ESTIMATE, item 8) -------------
-def width_estimate(acc_vec, nmax):
-    """ESTIMATE of the target verify batch width from per-position acceptance:
-    accepted = longest accepted prefix of the draft; width = 1 + accepted.
-    Chain rule (independence across positions) — NOT a measured per-step
-    distribution; the exact per-step widths are not exposed by the server."""
-    if not acc_vec or nmax <= 0:
-        return None
-    n = min(len(acc_vec), nmax)
-    dist = {}
-    surv = 1.0
-    for k in range(n):
-        dist[1 + k] = surv * (1 - acc_vec[k])
-        surv *= acc_vec[k]
-    dist[1 + n] = surv
-    exp = sum(w * p for w, p in dist.items())
-    return dist, exp
+# Accepted-prefix distribution + exact means come from spec_metrics.py
+# (Prometheus counter deltas + survival math, unit-tested statically).
+# Chain-rule width_estimate was REMOVED: llama-server's acc-per-pos values
+# (n_accepted_per_pos[i] / n_draft_verif_steps) are already unconditional
+# survival probabilities P(A >= i+1) — never chain-multiply them again.
 
 def render(rs, cap_label):
     if not rs:
@@ -124,14 +122,15 @@ def render(rs, cap_label):
             if w.startswith(("CODING", "EDIT", "AGENT", "JSON")): coding.append(e)
         print(f"| {t} | {c} | " + " | ".join(cells) + (f" | **{st.median(coding):.1f}** |" if coding else " | — |"))
 
-    print("\n## Per-step cost — ALL derived values are ESTIMATE (NOT measured verify latency)\n")
-    print("| test | config | ms/step EST | TTFT ms | prefill tok/s | spread eff. tok/s (min-max) | label |")
+    print("\n## Per-step cost — ms/spec-step from EXACT /metrics verification_steps "
+          "(wall overhead folded in; NOT a measured verify latency)\n")
+    print("| test | config | ms/spec-step EST | TTFT ms | prefill tok/s | spread eff. tok/s (min-max) | metrics |")
     print("|---|---|---|---|---|---|---|")
     for t, c in configs:
         rs_c = [r for (tt, cc, _), v in gg.items() if (tt, cc) == (t, c) for r in v]
         effs = [float(r["effective_tps"]) for r in rs_c]
-        labels = sorted({(r.get("verify_latency_label") or "").split(":")[0] for r in rs_c})
-        print(f"| {t} | {c} | {med(r.get('ms_per_verify_EST') for r in rs_c):.2f} | "
+        labels = sorted({(r.get("metrics_label") or "").split(":")[0].strip() for r in rs_c})
+        print(f"| {t} | {c} | {med(r.get('ms_per_spec_step_EST') for r in rs_c):.2f} | "
               f"{med(r['ttft_ms'] for r in rs_c):.0f} | {med(r['prefill_tps'] for r in rs_c):.0f} | "
               f"{min(effs):.1f}-{max(effs):.1f} | {'/'.join(labels) or '—'} |")
 
@@ -140,43 +139,71 @@ def render(rs, cap_label):
                 and nmax_of(r) > 0 and float(r.get("draft_n") or 0) > 0]
     if mtp_rows:
         print("\n## MTP verification — REAL (T5/T6/T7)\n")
-        print("draft_n / draft_n_accepted come from the server API timings; acceptance per "
-              "position from the `-lv 4` trace; predicted_ms and wall time are measured totals. "
-              "The batch-width column is an ESTIMATE (chain rule from per-position acceptance).\n")
-        print("| test | config | draft_n med | draft_n_accepted med | acceptance med | "
-              "predicted_ms sum | wall_s sum | eff tok/s med | verify ms/step EST | batch width EST |")
-        print("|---|---|---|---|---|---|---|---|---|---|")
+        print("draft_n / draft_n_accepted come from the server API timings; "
+              "verification_steps / draft_tokens / accepted_tokens / per-position survivals "
+              "from BEFORE/AFTER `/metrics` Prometheus counter deltas "
+              "(exact — spec_metrics.py); predicted_ms and wall time are measured totals.\n")
+        # Exact counters: means recomputed from SUMS per config (equal weight) —
+        # never chain-rule-multiplied, never last-request-wins.
+        print("| test | config | verif_steps Σ | draft_tokens Σ | accepted_tokens Σ | "
+              "mean_draft/step | mean_accepted/step | mean_target_width | acceptance Σ | "
+              "predicted_ms sum | wall_s sum | ms/spec-step | metrics |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         by_cfg = defaultdict(list)
         for r in mtp_rows:
             by_cfg[(r["test"], r["config"])].append(r)
-        acc_cfg = {}
+        # ALL acc_per_pos rows per config (append — never last-wins overwrite)
+        acc_cfg = defaultdict(list)
         ap = os.path.join(run, "acc_per_pos.csv")
         if os.path.exists(ap):
             for line in csv.reader(open(ap)):
                 if len(line) >= 4:
-                    acc_cfg[line[0]] = parse_acc_vec(line[3])
+                    acc_cfg[line[0]].append(parse_acc_vec(line[3]))
+        def _fsum(rows, key):
+            tot = 0.0
+            for r in rows:
+                try:
+                    tot += float(r.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+            return tot
         for (t, c), rs_c in sorted(by_cfg.items()):
-            nm = nmax_of(rs_c[0])
-            vec = acc_cfg.get(c, [])
-            we = width_estimate(vec, nm)
-            wtxt = f"E[width]={we[1]:.2f}" if we else "—"
-            print(f"| {t} | {c} | {med(r['draft_n'] for r in rs_c):.0f} | "
-                  f"{med(r['draft_accepted'] for r in rs_c):.0f} | {med(r['acceptance'] for r in rs_c):.2f} | "
-                  f"{sum(float(r['predicted_ms']) for r in rs_c):.0f} | "
-                  f"{sum(float(r['wall_s']) for r in rs_c):.1f} | "
-                  f"{med(r['effective_tps'] for r in rs_c):.1f} | "
-                  f"{med(r.get('ms_per_verify_EST') for r in rs_c):.2f} | {wtxt} |")
-        print("\nTarget batch width distribution (ESTIMATE — chain rule from per-position "
-              "acceptance, widths = 1 + accepted draft tokens; not a measured per-step distribution):\n")
+            steps = _fsum(rs_c, "verification_steps")
+            draft = _fsum(rs_c, "draft_tokens")
+            acc_t = _fsum(rs_c, "accepted_tokens")
+            md = draft / steps if steps else 0.0
+            ma = acc_t / steps if steps else 0.0
+            width = 1.0 + draft / steps if steps else 0.0
+            pms = sum(float(r["predicted_ms"]) for r in rs_c)
+            acc = (acc_t / draft) if draft else med(r["acceptance"] for r in rs_c)
+            msp_step = (pms / steps) if steps else 0.0
+            label = next((str(r.get("metrics_label") or "") for r in rs_c
+                          if r.get("metrics_label")), "—")
+            print(f"| {t} | {c} | {steps:.0f} | {draft:.0f} | {acc_t:.0f} | "
+                  f"{md:.2f} | {ma:.2f} | {width:.3f} | {acc:.4f} | "
+                  f"{pms:.0f} | {sum(float(r['wall_s']) for r in rs_c):.1f} | "
+                  f"{msp_step:.2f} | {label[:40]} |")
+        # Accepted-prefix distribution from UNCONDITIONAL survivals —
+        # P(A=0)=1-r0, P(A=k)=r[k-1]-r[k], P(A=K)=r[K-1].  NEVER chain-multiply.
+        print("\nAccepted-prefix distribution P(A=k) from per-position survivals "
+              "r[i]=P(A>=i+1) (equal-weight mean per config):\n")
         for (t, c) in sorted(by_cfg):
-            nm = nmax_of(by_cfg[(t, c)][0])
-            vec = acc_cfg.get(c, [])
-            we = width_estimate(vec, nm)
-            if not we:
+            surv_rows = []
+            for r in by_cfg[(t, c)]:
+                v = sm.parse_survival_field(r.get("survival_per_pos") or "")
+                if v:
+                    surv_rows.append(v)
+            source = "/metrics survival_per_pos (exact)"
+            if not surv_rows:
+                surv_rows = [v for v in acc_cfg.get(c, []) if v]
+                source = "server-trace acc-per-pos fallback (averaged)"
+            rvec = sm.average_survival(surv_rows)
+            if not rvec:
+                print(f"- {t}/{c}: no survival/acceptance data")
                 continue
-            dist, exp = we
-            hist = "  ".join(f"P(w={w})={p:.3f}" for w, p in sorted(dist.items()))
-            print(f"- {t}/{c} (n_max={nm}): {hist}  → **E[width] = {exp:.2f}**")
+            dist = sm.accepted_prefix_distribution(rvec)
+            hist = ", ".join(f"P(A={k})={p:.3f}" for k, p in enumerate(dist))
+            print(f"- {t}/{c} (K={len(rvec)}, n={len(surv_rows)} reqs, {source}): {hist}")
         prof_sum = os.path.join(run, "profile", "kernel-summary.csv")
         if os.path.exists(prof_sum):
             print(f"\nKernel trace (PROFILE=1): `{os.path.relpath(prof_sum, run)}` "

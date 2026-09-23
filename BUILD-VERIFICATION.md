@@ -64,14 +64,17 @@ test-backend-ops test -o MUL_MAT / MUL_MAT_ID / FLASH_ATTN_EXT / GATED_DELTA_NET
 test-backend-ops test -o MUL_MAT_VEC_FUSION -b ROCm0   (fused gate/GLU path, Q4_0 n=1)
 ```
 
-Any `FAIL` aborts the build/benchmark (`do not benchmark this build`).
+Any `FAIL` **or any nonzero exit** aborts the build/benchmark
+(`do not benchmark this build`). There is no `|| true` escape on
+`MUL_MAT_VEC_FUSION` — the gate must fail the build loudly.
 
 ## 5. Harness verification (no GPU)
 
 | Check | Command |
 |---|---|
+| static test battery (no GPU) | `./tests/static-tests.sh` — bash -n, py_compile (`summarize.py spec_metrics.py isa_verify.py`), Prometheus parser fixture, MTP survival-math fixture (no chain rule), repeated run-name rejection (`ALLOW_APPEND`), verify-isa multi-ELF (synthesized ELFs + fake objdump, e_flags PASS condition), record_cap FAIL/`ALLOW_POWER_MISMATCH`, contract greps |
 | shell syntax | `for f in *.sh; do bash -n "$f"; done` |
-| python syntax | `python3 -m py_compile summarize.py` |
+| python syntax | `python3 -m py_compile summarize.py spec_metrics.py isa_verify.py` |
 | full harness dry run | `DRY_RUN=1 ./benchmark-mi50.sh dry <build> <model> T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10` — must finish in seconds (no `sleep 5` in `srv_stop`, monitor/server never launch) |
 | preflight | `./preflight.sh` ends `READY_FOR_MI50_BENCHMARK` or `NOT_READY:` + reasons |
 
@@ -83,5 +86,6 @@ Any `FAIL` aborts the build/benchmark (`do not benchmark this build`).
 * T3-SYNTHETIC-NCOL costs and the real T5/T6/T7 MTP verification measurements
 * T8 long-context behaviour at 8k/32k/64k
 
-That is exactly what `./preflight.sh` → `./build.sh golden` →
-`./benchmark-mi50.sh …` is for — with **zero manual file edits**.
+That is exactly what `./build.sh golden` → `./preflight.sh` (READY) →
+`./benchmark-mi50.sh …` is for — with **zero manual file edits**
+(strict preflight needs the built binaries, so the build comes first).

@@ -29,6 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja
 COPY patches /opt/mi50/patches
 COPY build.sh benchmark-mi50.sh run-golden.sh power.sh preflight.sh summarize.py verify-isa.sh model-provenance.sh /opt/mi50/
 COPY prompts /opt/mi50/prompts
+# TSV defaults + shared helpers (verify-isa FAILs without the TSV)
+COPY build-verification /opt/mi50/build-verification
+COPY spec_metrics.py rocm-env.sh isa_verify.py /opt/mi50/
 RUN chmod +x /opt/mi50/*.sh && SKIP_TESTS=1 SRC=/src/llama.cpp OUT=/opt/mi50/builds ROCM_PATH=$ROCM_PATH \
     /opt/mi50/build.sh "$VARIANT" \
     && ln -s /opt/mi50/builds/$VARIANT/build/bin /opt/mi50/bin

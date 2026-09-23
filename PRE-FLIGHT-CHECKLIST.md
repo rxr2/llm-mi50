@@ -4,9 +4,10 @@ Four phases: **BEFORE SERVER ARRIVES** · **FIRST BOOT WITH MI50** · **FIRST 30
 MINUTES** · **FIRST 2 HOURS**. Nothing here requires editing a file by hand —
 every step is a command.
 
-The gate for everything after phase 2 is one command:
+The gate for everything after the build is one command:
 
 ```bash
+./build.sh golden      # first — strict preflight needs the built binaries
 ./preflight.sh
 ```
 
@@ -30,8 +31,9 @@ Do all of this on any dev machine (no GPU needed):
       ```
 - [ ] Run the static tests:
       ```bash
-      for f in *.sh; do bash -n "$f"; done
-      python3 -m py_compile summarize.py
+      ./tests/static-tests.sh      # bash -n, py_compile, Prometheus fixture,
+                                   # survival math, run-name rejection,
+                                   # verify-isa multi-ELF, record_cap, contracts
       ```
 - [ ] Run the harness dry run (finishes in seconds, needs no hardware):
       ```bash
@@ -119,30 +121,29 @@ ROCm userspace + build. Still no benchmark numbers.
       ```
 - [ ] Put the model where the tools look for it (or always pass the path):
       `/models/Qwen3.8-27B-Q4_0.gguf` (also probed: `~/models/`, `models/`).
-- [ ] **Run the gate:**
+- [ ] Build first (strict preflight needs the binaries; also generates the
+      ISA verification artifacts):
+      ```bash
+      ./build.sh golden
+      ls build-verification/disassembly/   # disassembly + isa-report.json
+      ```
+      `build.sh` fails if the golden patch series does not reproduce
+      `844e42b4b…`, if the MUL_MAT_VEC_FUSION correctness gate fails, or if
+      `verify-isa.sh` cannot confirm gfx906 ISA + scratch=0 for the default
+      breit kernels (q4_0 n=1/4/8, q5_K, q6_K — exact TSV defaults).
+- [ ] **Run the gate (after the build):**
       ```bash
       ./preflight.sh
       ```
-      Must end `READY_FOR_MI50_BENCHMARK`. Every `NOT_READY:` line names the
-      exact failing check (gfx906 detection, /dev/kfd, model sha256, build
-      binaries, ROCm identity, HSA override, PCIe link recording, power cap).
+      Must end `READY_FOR_MI50_BENCHMARK` and keep the `preflight-report/`
+      folder as the machine's birth certificate. Every `NOT_READY:` line
+      names the exact failing check (gfx906 detection, /dev/kfd, model
+      sha256, build binaries, ROCm identity + rocm-smi/rocprofv3 paths,
+      HSA override, PCIe link recording, power cap).
       Common fixes:
-      * build binaries missing → `./build.sh golden` (writes
-        `~/mi50-builds/golden/build/bin`, which `run-golden.sh` finds
-        automatically; or pass `BIN=`/`--build` explicitly)
       * power cap off → `sudo ./power.sh stock`
       * deliberate non-standard model → `ALLOW_MODEL_MISMATCH=1 ./preflight.sh`
         (recorded, never silent)
-- [ ] Build (also generates the ISA verification artifacts):
-      ```bash
-      ./build.sh golden
-      ls build-verification/disassembly/   # isa-verify-report.txt + per-kernel .s
-      ```
-      `build.sh` fails if the golden patch series does not reproduce
-      `844e42b4b…` or if `verify-isa.sh` cannot confirm gfx906 ISA + scratch=0
-      for the default breit kernels (q4_0 n=1/4/8, q5_K, q6_K).
-- [ ] Re-run `./preflight.sh` after the build — now with binaries — and keep
-      the `preflight-report/` folder as the machine's birth certificate.
 
 ---
 

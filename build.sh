@@ -19,7 +19,7 @@ VARIANT="${1:-golden}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SRC:-$HOME/src/llama.cpp-mi50}"
 OUT="${OUT:-$HOME/mi50-builds}"
-ROCM_PATH="${ROCM_PATH:-/opt/rocm-7.1.1}"
+ROCM_PATH="${ROCM_PATH:-}"   # explicit only — rocm-env.sh (line ~34) tries /opt/rocm-7.1.1, /opt/rocm, /opt/therock
 JOBS="${JOBS:-$(nproc)}"
 
 UPSTREAM_URL=https://github.com/ggml-org/llama.cpp.git
@@ -31,9 +31,15 @@ EXPECTED_GOLDEN_SHA=844e42b4b37a6717d03393155e9914332f891c34   # verified: git a
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------- toolchain ----------
-[ -x "$ROCM_PATH/bin/hipconfig" ] || die "ROCm not found at $ROCM_PATH (set ROCM_PATH)"
-export PATH="$ROCM_PATH/bin:$ROCM_PATH/lib/llvm/bin:$ROCM_PATH/llvm/bin:$PATH"
-export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib/llvm/lib:${LD_LIBRARY_PATH:-}"
+# Shared ROCm resolution — identical to preflight.sh / benchmark-mi50.sh
+# (rocm-env.sh): candidate order /opt/rocm-7.1.1, /opt/rocm, /opt/therock;
+# an explicitly-exported ROCM_PATH must be valid (no silent fallback).
+# shellcheck source=rocm-env.sh
+. "$HERE/rocm-env.sh"
+if ! rocm_env_resolve; then
+  die "ROCm not found (tried \$ROCM_PATH, ${_ROCM_CANDIDATE_LIST[*]})"
+fi
+export ROCM_PATH
 HIP_CLANG="$ROCM_PATH/lib/llvm/bin/clang"; [ -x "$HIP_CLANG" ] || HIP_CLANG="$ROCM_PATH/llvm/bin/clang"
 [ -x "$HIP_CLANG" ] || die "clang not found in ROCm"
 command -v cmake >/dev/null || die "cmake missing"
@@ -135,8 +141,17 @@ if [ "${SKIP_TESTS:-0}" != 1 ] && rocminfo 2>/dev/null | grep -q gfx906; then
   for op in MUL_MAT MUL_MAT_ID FLASH_ATTN_EXT GATED_DELTA_NET; do
     "$BUILD/bin/test-backend-ops" test -o "$op" -b ROCm0 2>&1 | tail -2 | tee -a "$OUT/$VARIANT/test-backend-ops.txt"
   done
-  # fused GEMV path (gate/up + GLU) used by Q4_0 n=1
-  "$BUILD/bin/test-backend-ops" test -o MUL_MAT_VEC_FUSION -b ROCm0 2>&1 | tail -2 | tee -a "$OUT/$VARIANT/test-backend-ops.txt" || true
-  grep -q "FAIL" "$OUT/$VARIANT/test-backend-ops.txt" && die "test-backend-ops FAILED — do not benchmark this build"
+  # fused GEMV path (gate/up + GLU) used by Q4_0 n=1 — STRICT correctness gate
+  # (review 2): any nonzero exit or FAIL output stops the build; no '|| true'.
+  set +e
+  "$BUILD/bin/test-backend-ops" test -o MUL_MAT_VEC_FUSION -b ROCm0 2>&1 | tail -2 | tee -a "$OUT/$VARIANT/test-backend-ops.txt"
+  FUSION_RC=${PIPESTATUS[0]}
+  set -e
+  if [ "$FUSION_RC" -ne 0 ]; then
+    die "MUL_MAT_VEC_FUSION test exited rc=$FUSION_RC — do not benchmark this build"
+  fi
+  if grep -q "FAIL" "$OUT/$VARIANT/test-backend-ops.txt"; then
+    die "test-backend-ops FAILED — do not benchmark this build"
+  fi
 fi
 echo "OK: $OUT/$VARIANT/build/bin/llama-server"

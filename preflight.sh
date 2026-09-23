@@ -45,13 +45,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-ROCM_PATH="${ROCM_PATH:-/opt/rocm-7.1.1}"   # same path install-rocm.sh 'stable' writes
+ROCM_PATH="${ROCM_PATH:-}"   # explicit override only; rocm-env.sh picks the candidate (7.1.1 first)
 POWER_CAP_MIN="${POWER_CAP_MIN:-220}"
 POWER_CAP_MAX="${POWER_CAP_MAX:-226}"
 ALLOW_MODEL_MISMATCH="${ALLOW_MODEL_MISMATCH:-0}"
-SMI="${SMI:-rocm-smi}"
+SMI="${SMI:-rocm-smi}"       # placeholder — replaced by the resolved rocm-smi path after rocm-env.sh
 GPU="${GPU:-0}"
-ROCM_PROBES=$(printf '%s\n' "$ROCM_PATH" /opt/rocm-7.1.1 /opt/rocm /opt/therock | awk '!seen[$0]++' | paste -sd' ' -)
+ROCM_PROBES="/opt/rocm-7.1.1 /opt/rocm /opt/therock"
 
 FAIL=(); WARN=()
 fail() { FAIL+=("$1"); }
@@ -81,29 +81,48 @@ else
   GPU_BDF=""
 fi
 
-# ROCm identification ---------------------------------------------------------
+# ROCm identification + tools (shared rocm-env.sh — build.sh and
+# benchmark-mi50.sh source the SAME file, so READY ⇒ the benchmark finds the
+# SAME rocm-smi / rocprofv3 / hipconfig paths later)
+# shellcheck source=rocm-env.sh
+. "$HERE/rocm-env.sh"
 ROCM_FOUND=""
-for R in "$ROCM_PATH" /opt/rocm-7.1.1 /opt/rocm /opt/therock; do
-  if [ -x "$R/bin/rocminfo" ] || [ -x "$R/bin/hipconfig" ]; then
-    ROCM_FOUND="$R"; break
-  fi
-done
-if [ -n "$ROCM_FOUND" ]; then
-  ROCM_VER=$(cat "$ROCM_FOUND"/.info/version* 2>/dev/null | head -1 || true)
-  [ -z "$ROCM_VER" ] && ROCM_VER=$("$ROCM_FOUND/bin/hipconfig" --version 2>/dev/null | head -1 || true)
+if rocm_env_resolve; then
+  ROCM_FOUND="$ROCM_PATH"
+  ROCM_VER=$(cat "$ROCM_PATH"/.info/version* 2>/dev/null | head -1 || true)
+  [ -z "$ROCM_VER" ] && [ -n "${HIPCONFIG:-}" ] && ROCM_VER=$("$HIPCONFIG" --version 2>/dev/null | head -1 || true)
   echo "[PASS] ROCm identified: $ROCM_FOUND ${ROCM_VER:+($ROCM_VER)}"
-  if [ -x "$ROCM_FOUND/bin/rocminfo" ]; then
-    "$ROCM_FOUND/bin/rocminfo" > "$REPORT/rocminfo.txt" 2>/dev/null || true
+  if [ -n "${ROCMINFO:-}" ] && [ -x "${ROCMINFO}" ]; then
+    "$ROCMINFO" > "$REPORT/rocminfo.txt" 2>/dev/null || true
     if grep -Eq 'gfx906|amdgcn-amd-amdhsa--gfx906' "$REPORT/rocminfo.txt"; then
       echo "[PASS] gfx906 target reported by rocminfo"
     else
       fail "rocminfo does not report gfx906 (no usable MI50 agent / driver problem)"
     fi
   else
-    fail "rocminfo missing in $ROCM_FOUND — cannot confirm gfx906"
+    fail "rocminfo missing in ${ROCM_PATH:-the ROCm tree} — cannot confirm gfx906"
   fi
 else
-  fail "ROCm not identified (tried: $ROCM_PROBES) — run ./install-rocm.sh stable"
+  fail "ROCm not identified (tried: \$ROCM_PATH, $ROCM_PROBES) — run ./install-rocm.sh stable"
+  ROCM_PATH="" ROCM_SMI="" ROCPROFV3="" HIPCONFIG="" ROCMINFO=""
+fi
+
+# ---- tools the benchmark needs later (READY ⇒ present under this resolution)
+if [ -n "${ROCM_SMI:-}" ] && [ -x "${ROCM_SMI}" ]; then
+  echo "[PASS] rocm-smi: $ROCM_SMI"
+  [ "${SMI}" = rocm-smi ] && SMI="$ROCM_SMI"
+else
+  fail "rocm-smi missing in ROCm tree (benchmark record_cap/monitor would fail with the same env)"
+fi
+if [ -n "${ROCPROFV3:-}" ] && [ -x "${ROCPROFV3}" ]; then
+  echo "[PASS] rocprofv3: $ROCPROFV3"
+else
+  fail "rocprofv3 missing (PROFILE=1 would fail later with the same env)"
+fi
+if [ -n "${HIPCONFIG:-}" ] && [ -x "${HIPCONFIG}" ]; then
+  echo "[PASS] hipconfig: $HIPCONFIG"
+else
+  fail "hipconfig missing in ROCm tree"
 fi
 
 # /dev/kfd --------------------------------------------------------------------
