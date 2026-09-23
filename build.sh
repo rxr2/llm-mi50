@@ -8,15 +8,18 @@
 #   ./build.sh alex-exact        # Plan B reference: alex4300 gfx906 @ f9616ce, unmodified
 #   ./build.sh upstream          # Plan B reference: plain upstream 42916d83, no gfx906 patches
 #
-# ROCm selection: ROCM_PATH=/opt/rocm-7.1.0 (STABLE, default) or ROCM_PATH=/opt/therock (MODERN)
+# ROCm selection: ROCM_PATH=/opt/rocm-7.1.1 (STABLE, default — same path
+# install-rocm.sh writes) or ROCM_PATH=/opt/therock (MODERN)
 # Output: $OUT/<variant>/ with bin/, build-info.txt, CMakeCache.txt, patch list, git status.
+# After the build, gfx906 ISA verification artifacts are written to
+# build-verification/disassembly/ (skip: SKIP_ISA=1).
 set -euo pipefail
 
 VARIANT="${1:-golden}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SRC:-$HOME/src/llama.cpp-mi50}"
 OUT="${OUT:-$HOME/mi50-builds}"
-ROCM_PATH="${ROCM_PATH:-/opt/rocm-7.1.0}"
+ROCM_PATH="${ROCM_PATH:-/opt/rocm-7.1.1}"
 JOBS="${JOBS:-$(nproc)}"
 
 UPSTREAM_URL=https://github.com/ggml-org/llama.cpp.git
@@ -115,6 +118,17 @@ INFO="$OUT/$VARIANT/build-info.txt"
 } > "$INFO"
 cp "$BUILD/CMakeCache.txt" "$OUT/$VARIANT/CMakeCache.txt"
 cat "$INFO"
+
+# ---------- ISA verification artifacts (gfx906, no GPU needed) ----------
+# Disassemble the required breit kernels (q4_0 n=1/4/8, q5_K, q6_K) with
+# roc-objdump/llvm-objdump, confirm gfx906 ISA is present and that the default
+# instantiations carry no private-segment (scratch). No performance claims are
+# made here — that needs the MI50 (T0/T1). Artifacts: build-verification/disassembly/.
+if [ "${SKIP_ISA:-0}" != 1 ]; then
+  ROCM_PATH="$ROCM_PATH" "$HERE/verify-isa.sh" "$BUILD"
+else
+  echo "SKIP_ISA=1 — no ISA verification artifacts generated"
+fi
 
 # ---------- mandatory correctness gate (needs the GPU) ----------
 if [ "${SKIP_TESTS:-0}" != 1 ] && rocminfo 2>/dev/null | grep -q gfx906; then

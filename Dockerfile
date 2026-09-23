@@ -27,7 +27,7 @@ ARG VARIANT=golden
 RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build g++ python3 curl ca-certificates libssl-dev jq bc \
     && rm -rf /var/lib/apt/lists/*
 COPY patches /opt/mi50/patches
-COPY build.sh benchmark-mi50.sh run-golden.sh /opt/mi50/
+COPY build.sh benchmark-mi50.sh run-golden.sh power.sh preflight.sh summarize.py verify-isa.sh model-provenance.sh /opt/mi50/
 COPY prompts /opt/mi50/prompts
 RUN chmod +x /opt/mi50/*.sh && SKIP_TESTS=1 SRC=/src/llama.cpp OUT=/opt/mi50/builds ROCM_PATH=$ROCM_PATH \
     /opt/mi50/build.sh "$VARIANT" \
