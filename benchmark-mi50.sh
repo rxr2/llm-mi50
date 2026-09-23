@@ -262,10 +262,11 @@ trap 'mon_stop; srv_stop' EXIT
 # /metrics snapshots — the raw json goes to a warmup_-prefixed file instead.
 # A MEASURED request snapshots /metrics BEFORE and AFTER and stores counter
 # DELTAS (exact verification_steps / draft_tokens / accepted_tokens /
-# per-position survivals — spec_metrics.py). Snapshot failure ABORTS (set -e).
+# per-position survivals + raw per_pos_counts with ZERO deltas preserved —
+# spec_metrics.py). Snapshot failure ABORTS (set -e).
 # No row is ever deleted afterwards (fixes the old `sed -i '$d'` bug).
 REQ_CSV="$OUT/requests.csv"
-[ -f "$REQ_CSV" ] || echo "test,config,workload,rep,seed,temp,ctx,n_max,prompt_n,prompt_ms,prefill_tps,predicted_n,predicted_ms,effective_tps,draft_n,draft_accepted,acceptance,verification_steps,draft_tokens,accepted_tokens,mean_draft_tokens_per_step,mean_accepted_tokens_per_step,mean_target_width,survival_per_pos,ms_per_spec_step_EST,wall_s,ttft_ms,output_sha256,metrics_label" > "$REQ_CSV"
+[ -f "$REQ_CSV" ] || echo "test,config,workload,rep,seed,temp,ctx,n_max,prompt_n,prompt_ms,prefill_tps,predicted_n,predicted_ms,effective_tps,draft_n,draft_accepted,acceptance,verification_steps,draft_tokens,accepted_tokens,mean_draft_tokens_per_step,mean_accepted_tokens_per_step,mean_target_width,survival_per_pos,per_pos_counts,ms_per_spec_step_EST,wall_s,ttft_ms,output_sha256,metrics_label" > "$REQ_CSV"
 request() { # test config workload rep n_max [n_predict] [temp] [prompt_file] [warmup=0]
   local t="$1" cfg="$2" wl="$3" rep="$4" nmax="$5" np="${6:-$NPRED}" temp="${7:-$TEMP}" pf="${8:-$PROMPTS/$3.txt}" warm="${9:-0}"
   local seed=$((42 + rep)) rawname="${cfg}_${wl}_r${rep}.json"
@@ -324,7 +325,8 @@ mdraft = means.get("mean_draft_tokens_per_step", "")
 macc = means.get("mean_accepted_tokens_per_step", "")
 width = means.get("mean_target_width", "")
 ms_step = (pms / steps) if steps and pms else ""
-surv_field = ";".join(f"{x:.4f}" for x in surv)   # ';'-joined: CSV-safe
+surv_field = ";".join(f"{x:.4f}" for x in surv)          # ';'-joined: CSV-safe
+counts_field = ";".join(str(x) for x in sm.per_pos_vector(d["per_pos"]))  # raw ints, zeros kept
 if steps > 0:
     label = "exact: /metrics spec_decode counter deltas"
 elif dn:
@@ -338,12 +340,13 @@ print(",".join(map(str, [t, cfg, wl, rep, seed, temp, ctx, nmax, g("prompt_n"), 
       round(macc, 3) if macc != "" else "",
       round(width, 4) if width != "" else "",
       surv_field,
+      counts_field,
       round(ms_step, 3) if ms_step != "" else "",
       round(wall, 3), round(ttft or 0, 1), hashlib.sha256(out.encode()).hexdigest()[:16], label])))
 EOF
   [ "$warm" = 1 ] && return 0
   check_thermal
-  tail -1 "$REQ_CSV" | awk -F, '{printf "   -> %s %s %s: %s tok/s eff, acc %s, ttft %s ms\n",$1,$2,$3,$14,$17,$27}' | tee -a "$LOG" >&2
+  tail -1 "$REQ_CSV" | awk -F, '{printf "   -> %s %s %s: %s tok/s eff, acc %s, ttft %s ms\n",$1,$2,$3,$14,$17,$28}' | tee -a "$LOG" >&2
 }
 
 # per-position acceptance + mean len from the server trace log (-lv 4)
@@ -511,12 +514,30 @@ EOF
   }
   # thermal monitoring covers EVERY meaningful GPU-load benchmark (7), incl. T0/T1
   mon_start "$OUT/T0/power.csv"
+  # Exit-code correctness (review 3): capture test-backend-ops' OWN status —
+  # never tail's (the old `cmd > file; tail file` chain returned tail's rc).
+  # For EVERY T0 op including MUL_MAT_VEC_FUSION:
+  #   nonzero exit -> STOP   AND   text FAIL -> STOP.
+  # A segfault (139) with no literal "FAIL" must also stop the run.
   for op in MUL_MAT MUL_MAT_ID FLASH_ATTN_EXT GATED_DELTA_NET MUL_MAT_VEC_FUSION; do
-    run bash -c "$NPFX '$BIN/test-backend-ops' test -o $op -b ROCm0 > '$OUT/T0/test_$op.txt' 2>&1; tail -3 '$OUT/T0/test_$op.txt'"
+    op_out="$OUT/T0/test_$op.txt"
+    if [ "$DRY_RUN" = 1 ]; then
+      log "test-backend-ops test -o $op -b ROCm0  (dry)"
+      continue
+    fi
+    set +e
+    bash -c "$NPFX '$BIN/test-backend-ops' test -o $op -b ROCm0 > '$op_out' 2>&1"
+    op_rc=$?
+    set -e
+    tail -3 "$op_out" 2>/dev/null | tee -a "$LOG" >&2 || true
+    if [ "$op_rc" -ne 0 ]; then
+      log "CORRECTNESS FAIL — test-backend-ops $op exited rc=$op_rc (no 'FAIL' text required) — stopping"
+      exit 2
+    fi
   done
   mon_stop
   check_thermal
-  [ "$DRY_RUN" = 1 ] || ! grep -l "FAIL" "$OUT"/T0/test_*.txt >/dev/null 2>&1 || { log "CORRECTNESS FAIL — stopping"; exit 2; }
+  [ "$DRY_RUN" = 1 ] || ! grep -l "FAIL" "$OUT"/T0/test_*.txt >/dev/null 2>&1 || { log "CORRECTNESS FAIL — text FAIL in op output — stopping"; exit 2; }
 fi
 
 # ================================================================= T1 kernel micro-bench (cutover table)

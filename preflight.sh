@@ -107,22 +107,46 @@ else
   ROCM_PATH="" ROCM_SMI="" ROCPROFV3="" HIPCONFIG="" ROCMINFO=""
 fi
 
-# ---- tools the benchmark needs later (READY ⇒ present under this resolution)
-if [ -n "${ROCM_SMI:-}" ] && [ -x "${ROCM_SMI}" ]; then
-  echo "[PASS] rocm-smi: $ROCM_SMI"
-  [ "${SMI}" = rocm-smi ] && SMI="$ROCM_SMI"
+# ---- tools the benchmark needs later — LOCATE and EXECUTE them, so READY
+# means the tools actually start and dynamic libraries resolve (review 4)
+[ "${SMI:-}" = rocm-smi ] && [ -n "${ROCM_SMI:-}" ] && SMI="$ROCM_SMI"
+
+# hipconfig --version must run cleanly
+if [ -n "${HIPCONFIG:-}" ] && [ -x "${HIPCONFIG}" ]; then
+  HIP_VER="$("$HIPCONFIG" --version 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && ! printf '%s' "$HIP_VER" | grep -q 'error while loading shared libraries'; then
+    echo "[PASS] hipconfig --version: $(printf '%s' "$HIP_VER" | head -1)"
+  else
+    fail "hipconfig --version does not run (rc=$rc): $(printf '%s' "$HIP_VER" | head -1)"
+  fi
 else
-  fail "rocm-smi missing in ROCm tree (benchmark record_cap/monitor would fail with the same env)"
+  fail "hipconfig missing in ROCm tree"
 fi
+
+# rocprofv3 must start: --version, else --help (LD path includes extra-libs/libdw)
 if [ -n "${ROCPROFV3:-}" ] && [ -x "${ROCPROFV3}" ]; then
-  echo "[PASS] rocprofv3: $ROCPROFV3"
+  PROF_OUT="$("$ROCPROFV3" --version 2>&1)"; rc=$?
+  if [ $rc -ne 0 ]; then PROF_OUT="$("$ROCPROFV3" --help 2>&1)"; rc=$?; fi
+  if [ $rc -eq 0 ] && ! printf '%s' "$PROF_OUT" | grep -q 'error while loading shared libraries'; then
+    echo "[PASS] rocprofv3 starts: $(printf '%s' "$PROF_OUT" | head -1 | cut -c1-70)"
+  else
+    fail "rocprofv3 does not start (rc=$rc): $(printf '%s' "$PROF_OUT" | head -1)"
+  fi
 else
   fail "rocprofv3 missing (PROFILE=1 would fail later with the same env)"
 fi
-if [ -n "${HIPCONFIG:-}" ] && [ -x "${HIPCONFIG}" ]; then
-  echo "[PASS] hipconfig: $HIPCONFIG"
+
+# rocm-smi harmless query — must start and resolve dynamic libraries
+if [ -n "${ROCM_SMI:-}" ] && [ -x "${ROCM_SMI}" ]; then
+  SMI_OUT="$("$ROCM_SMI" -d "$GPU" --showproductname 2>&1)"; rc=$?
+  if [ $rc -ne 126 ] && [ $rc -ne 127 ] \
+     && ! printf '%s' "$SMI_OUT" | grep -q 'error while loading shared libraries'; then
+    echo "[PASS] rocm-smi starts (--showproductname rc=$rc): $(printf '%s' "$SMI_OUT" | head -1 | cut -c1-70)"
+  else
+    fail "rocm-smi does not start (rc=$rc): $(printf '%s' "$SMI_OUT" | head -1)"
+  fi
 else
-  fail "hipconfig missing in ROCm tree"
+  fail "rocm-smi missing in ROCm tree (benchmark record_cap/monitor would fail with the same env)"
 fi
 
 # /dev/kfd --------------------------------------------------------------------

@@ -185,25 +185,56 @@ def render(rs, cap_label):
                   f"{msp_step:.2f} | {label[:40]} |")
         # Accepted-prefix distribution from UNCONDITIONAL survivals —
         # P(A=0)=1-r0, P(A=k)=r[k-1]-r[k], P(A=K)=r[K-1].  NEVER chain-multiply.
+        # Aggregation is EXACT and verification_steps-weighted (review 2):
+        #   r[i] = sum(counts[i]) / sum(steps)  — a 100-step request weighs
+        # 10x a 10-step request; NEVER an equal-weight mean of per-request
+        # survival vectors when exact steps are known.
         print("\nAccepted-prefix distribution P(A=k) from per-position survivals "
-              "r[i]=P(A>=i+1) (equal-weight mean per config):\n")
+              "r[i]=P(A>=i+1) (EXACT, verification_steps-weighted per config):\n")
         for (t, c) in sorted(by_cfg):
-            surv_rows = []
-            for r in by_cfg[(t, c)]:
-                v = sm.parse_survival_field(r.get("survival_per_pos") or "")
-                if v:
+            rows_c = by_cfg[(t, c)]
+            counts_list, steps_list = [], []
+            for r in rows_c:
+                try:
+                    s = int(float(r.get("verification_steps") or 0))
+                except (TypeError, ValueError):
+                    s = 0
+                cnt = sm.parse_counts_field(r.get("per_pos_counts") or "")
+                if cnt:
+                    counts_list.append(cnt)
+                    steps_list.append(s)
+            nreq = 0
+            if counts_list:
+                rvec = sm.weighted_survival(counts_list, steps_list)
+                source = "/metrics per_pos_counts (steps-weighted, exact)"
+                nreq = len(counts_list)
+            else:
+                surv_rows, surv_steps = [], []
+                for r in rows_c:
+                    v = sm.parse_survival_field(r.get("survival_per_pos") or "")
+                    if not v:
+                        continue
+                    try:
+                        s = int(float(r.get("verification_steps") or 0))
+                    except (TypeError, ValueError):
+                        s = 0
                     surv_rows.append(v)
-            source = "/metrics survival_per_pos (exact)"
-            if not surv_rows:
-                surv_rows = [v for v in acc_cfg.get(c, []) if v]
-                source = "server-trace acc-per-pos fallback (averaged)"
-            rvec = sm.average_survival(surv_rows)
+                    surv_steps.append(s)
+                if surv_rows:
+                    rvec = sm.weighted_survival_vectors(surv_rows, surv_steps)
+                    source = "survival_per_pos fallback (steps-weighted)"
+                    nreq = len(surv_rows)
+                else:
+                    trace_rows = [v for v in acc_cfg.get(c, []) if v]
+                    rvec = sm.average_survival(trace_rows)
+                    source = "server-trace acc-per-pos fallback (equal-weight, no steps)"
+                    nreq = len(trace_rows)
             if not rvec:
                 print(f"- {t}/{c}: no survival/acceptance data")
                 continue
             dist = sm.accepted_prefix_distribution(rvec)
             hist = ", ".join(f"P(A={k})={p:.3f}" for k, p in enumerate(dist))
-            print(f"- {t}/{c} (K={len(rvec)}, n={len(surv_rows)} reqs, {source}): {hist}")
+            print(f"- {t}/{c} (K={len(rvec)}, n={nreq} reqs, {source}): {hist}")
         prof_sum = os.path.join(run, "profile", "kernel-summary.csv")
         if os.path.exists(prof_sum):
             print(f"\nKernel trace (PROFILE=1): `{os.path.relpath(prof_sum, run)}` "
